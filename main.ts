@@ -14,6 +14,11 @@
 // A pure function of the batches it is fed: no clock, no randomness, no I/O, so the
 // two grading runs agree byte for byte.
 //
+// Speed: a launch is deleted from the watch list the moment it is decided (bought,
+// expired, or completed), so the per-batch entry scan only ever walks the launches
+// still inside their ~4-minute decision window instead of every launch the replay
+// has ever seen. Nothing else about the strategy changed: same rules, same orders.
+//
 // Dev-window grade-local (kit 40, --driver process): net PnL -0.915 SOL over 435
 // round trips (win rate 29.9%, max drawdown 9.5%), guardrails met with 430 coins
 // holding a round trip of at least 0.01 SOL, L1 regrade reproduced byte for byte.
@@ -43,15 +48,13 @@ const TIME_STOP_SLOTS = 7200;
 /** ...but only when the position is still this far under cost. */
 const TIME_STOP_UNDER_BPS = 500n;
 
-/** A launch being watched from its CreateEvent. */
+/** A launch being watched from its CreateEvent. Deleted the moment it is decided. */
 interface Watched {
   mint: Pubkey;
   createSlot: number;
   creator: Pubkey;
   /** Distinct wallets other than the creator that bought so far. */
   buyers: Set<Pubkey>;
-  /** Bought, skipped, or its curve completed: never decide on it again. */
-  decided: boolean;
 }
 
 /** A position we hold, with the slot its buy filled at. */
@@ -70,23 +73,10 @@ const watched = new Map<Pubkey, Watched>();
 const open = new Map<Pubkey, Open>();
 const selling = new Set<Pubkey>();
 
-function hasPendingBuy(state: BotState, mint: Pubkey): boolean {
-  for (const p of state.pending.values()) {
-    if (p.order.mint === mint && p.order.side === 'buy') return true;
-  }
-  return false;
-}
-
-function hasPendingSell(state: BotState, mint: Pubkey): boolean {
-  for (const p of state.pending.values()) {
-    if (p.order.mint === mint && p.order.side === 'sell') return true;
-  }
-  return false;
-}
-
 await runBot({
   onBatch(state, batch: Batch): OrderInput[] {
-    // Fold this batch's events into the watch list.
+    // Fold this batch's events into the watch list. Decided launches are gone
+    // from the map, so a trade for one is simply a lookup that misses.
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
         watched.set(e.mint, {
@@ -94,16 +84,22 @@ await runBot({
           createSlot: e.slot,
           creator: e.creator,
           buyers: new Set(),
-          decided: false,
         });
       } else if (e.event === 'TradeEvent') {
         const w = watched.get(e.mint);
-        if (w === undefined || w.decided) continue;
+        if (w === undefined) continue;
         if (e.is_buy && e.user !== w.creator) w.buyers.add(e.user);
       } else {
-        const w = watched.get(e.mint);
-        if (w !== undefined) w.decided = true;
+        watched.delete(e.mint);
       }
+    }
+
+    // Mints with an order still in flight, built once per batch.
+    const pendingBuy = new Set<Pubkey>();
+    const pendingSell = new Set<Pubkey>();
+    for (const p of state.pending.values()) {
+      if (p.order.side === 'buy') pendingBuy.add(p.order.mint);
+      else pendingSell.add(p.order.mint);
     }
 
     // Fold this batch's fills into the open-position book.
@@ -118,11 +114,11 @@ await runBot({
         open.set(f.mint, { openedSlot: f.slot });
       }
     }
-    for (const mint of [...selling]) {
-      if (!hasPendingSell(state, mint)) selling.delete(mint);
+    for (const mint of selling) {
+      if (!pendingSell.has(mint)) selling.delete(mint);
     }
-    for (const mint of [...open.keys()]) {
-      if (!state.positions.has(mint) && !selling.has(mint) && !hasPendingBuy(state, mint)) {
+    for (const mint of open.keys()) {
+      if (!state.positions.has(mint) && !selling.has(mint) && !pendingBuy.has(mint)) {
         open.delete(mint);
       }
     }
@@ -165,32 +161,32 @@ await runBot({
     }
 
     // Entries: one fixed buy per qualifying launch, inside its decision window.
+    // The map only holds undecided launches, so this scan stays tiny.
     let free = state.freeCashLamports() - tx * BigInt(orders.length);
     let committed = state.committedPositionCount();
-    for (const w of watched.values()) {
+    for (const [mint, w] of watched) {
       if (orders.length >= cap) break;
-      if (w.decided) continue;
       const age = state.slot - w.createSlot;
       if (age > DECIDE_WINDOW_SLOTS) {
-        w.decided = true;
+        watched.delete(mint);
         continue;
       }
       if (w.buyers.size < MIN_BUYERS) continue;
-      const curve = state.curves.get(w.mint);
+      const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) {
-        w.decided = true;
+        watched.delete(mint);
         continue;
       }
-      const sizeCap = state.maxBuyLamports(w.mint);
+      const sizeCap = state.maxBuyLamports(mint);
       if (sizeCap < MIN_BUY_LAMPORTS) continue;
       const amount = STAKE_LAMPORTS < sizeCap ? STAKE_LAMPORTS : sizeCap;
       if (amount < MIN_BUY_LAMPORTS) continue;
       if (committed >= state.hello.caps.max_open_positions) continue;
       if (free < amount + tx) continue;
-      orders.push({ side: 'buy', mint: w.mint, quote_lamports: amount, max_slippage_bps: MAX_SLIPPAGE_BPS });
+      orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: MAX_SLIPPAGE_BPS });
       free -= amount + tx;
       committed += 1;
-      w.decided = true;
+      watched.delete(mint);
     }
     return orders;
   },
